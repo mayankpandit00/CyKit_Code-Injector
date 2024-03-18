@@ -1,0 +1,5 @@
+colorama==0.4.6
+NetfilterQueue==1.1.0
+scapy==2.5.0
+scapy-http==1.8.2
+scapy-python3==0.26

